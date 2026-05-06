@@ -1,9 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Mic, Square, Download, Music, Activity, Layers, Trash2, Loader2, AlertCircle, Upload, CheckCircle2 } from 'lucide-react';
-import { BasicPitch } from '@spotify/basic-pitch';
+import { BasicPitch, outputToNotesPoly, noteFramesToTime } from '@spotify/basic-pitch';
 import * as tf from '@tensorflow/tfjs';
-import { midiToNoteName, pitchToFreq, categorizeNote, DetectedNote, formatTime } from '@/src/lib/audioUtils';
+import MidiWriter from 'midi-writer-js';
+import { midiToNoteName, pitchToFreq, categorizeNote, DetectedNote, formatTime, generateTrackerData } from '@/src/lib/audioUtils';
 
 const MODEL_URL = 'https://unpkg.com/@spotify/basic-pitch@1.0.1/model/model.json';
 
@@ -157,23 +158,26 @@ export const AudioAnalyzer: React.FC = () => {
       try {
         await basicPitchRef.current.evaluateModel(
           audioBuffer,
-          () => {}, // On pitch data
-          (notesData: any) => {
-            const actualNotes = Array.isArray(notesData) ? notesData : (notesData?.notes || []);
-            if (Array.isArray(actualNotes)) {
-              actualNotes.forEach((note: any) => {
-                const freq = pitchToFreq(note.pitchMidi);
-                detectedNotes.push({
-                  note: midiToNoteName(note.pitchMidi),
-                  frequency: freq,
-                  startTime: note.startTimeSeconds,
-                  endTime: note.startTimeSeconds + note.durationSeconds,
-                  duration: note.durationSeconds,
-                  velocity: note.amplitude,
-                  type: categorizeNote(freq)
-                });
+          (frames: number[][], onsets: number[][], contours: number[][]) => {
+            const noteEvents = outputToNotesPoly(frames, onsets, 0.25, 0.15, 5);
+            const timeEvents = noteFramesToTime(noteEvents);
+            
+            timeEvents.forEach((note) => {
+              const freq = pitchToFreq(note.pitchMidi);
+              detectedNotes.push({
+                note: midiToNoteName(Math.round(note.pitchMidi)),
+                frequency: freq,
+                startTime: note.startTimeSeconds,
+                endTime: note.startTimeSeconds + note.durationSeconds,
+                duration: note.durationSeconds,
+                velocity: note.amplitude,
+                type: categorizeNote(freq, note.pitchMidi),
+                midi: Math.round(note.pitchMidi)
               });
-            }
+            });
+          },
+          (percent: number) => {
+            console.log(`Analyzing: ${Math.round(percent * 100)}%`);
           }
         );
       } catch (evalErr: any) {
@@ -192,23 +196,95 @@ export const AudioAnalyzer: React.FC = () => {
     }
   };
 
+  const downloadMidi = () => {
+    // We create an importable Multi-Track MIDI for Vortex Tracker
+    const trackA = new MidiWriter.Track(); // Melody
+    const trackB = new MidiWriter.Track(); // Harmony
+    const trackC = new MidiWriter.Track(); // Bass
+    
+    // Setup tempo
+    trackA.addEvent(new MidiWriter.ProgramChangeEvent({instrument: 1}));
+    trackB.addEvent(new MidiWriter.ProgramChangeEvent({instrument: 1}));
+    trackC.addEvent(new MidiWriter.ProgramChangeEvent({instrument: 1}));
+    
+    const ticksPerBeat = 128; 
+    const fps = 50; // common tracker fps
+    
+    // We need to convert our arbitrary seconds to MIDI ticks
+    // Assuming 120 bpm (2 beats per sec). 1 beat = 128 ticks. 256 ticks per sec.
+    const secToTicks = (sec: number) => Math.round(sec * 256);
+    
+    const writeTrack = (type: string, track: any) => {
+      let currentTick = 0;
+      const typeNotes = notes.filter(n => n.type === type);
+      
+      typeNotes.forEach(note => {
+        const startTick = secToTicks(note.startTime);
+        const durationTick = secToTicks(note.duration);
+        const waitTick = startTick - currentTick;
+        
+        const midiEvent = new MidiWriter.NoteEvent({
+            pitch: [note.midi.toString()],
+            duration: `T${durationTick}`,
+            wait: waitTick > 0 ? `T${waitTick}` : 'T0',
+            velocity: Math.min(100, Math.round(note.velocity * 127))
+        });
+        
+        track.addEvent(midiEvent);
+        // NoteEvent consumes the duration, so currentTick advances by waitTick + durationTick
+        currentTick = startTick + durationTick;
+      });
+    };
+    
+    writeTrack('Channel A (Melody)', trackA);
+    writeTrack('Channel B (Harmony)', trackB);
+    writeTrack('Channel C (Bass)', trackC);
+    
+    const write = new MidiWriter.Writer([trackA, trackB, trackC]);
+    const uint8Array = write.buildFile();
+    
+    const blob = new Blob([uint8Array], {type: 'audio/midi'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Vortex-Export-${new Date().getTime()}.mid`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   const downloadJson = () => {
+    const pt3Data = generateTrackerData(notes);
+    
+    // Convert to Vortex Tracker friendly JSON format
     const data = {
       metadata: {
+        title: fileName || "Untitled",
         timestamp: new Date().toISOString(),
         totalNotes: notes.length,
-        duration: recordingTime
+        duration: recordingTime,
+        format: "PT3-Draft-JSON",
+        ticksPerRowSeconds: 0.12,
+        patterns: pt3Data.length
       },
-      melody: notes.filter(n => n.type === 'melody'),
-      bass: notes.filter(n => n.type === 'bass'),
-      raw: notes
+      raw_notes: notes,
+      tracker_patterns: pt3Data.map(p => ({
+        pattern_id: p.id,
+        rows: p.rows.map(r => ({
+           row: r.rowIdx.toString(16).padStart(2, '0').toUpperCase(), // hex row
+           a: r.channelA ? { note: r.channelA.note.padStart(3, '-'), start: r.channelA.startTime.toFixed(2) } : { note: "---" },
+           b: r.channelB ? { note: r.channelB.note.padStart(3, '-'), start: r.channelB.startTime.toFixed(2) } : { note: "---" },
+           c: r.channelC ? { note: r.channelC.note.padStart(3, '-'), start: r.channelC.startTime.toFixed(2) } : { note: "---" }
+        }))
+      }))
     };
     
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `audio-detection-${new Date().getTime()}.json`;
+    link.download = `pt3-export-${new Date().getTime()}.json`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -299,13 +375,27 @@ export const AudioAnalyzer: React.FC = () => {
           </div>
 
           <div className="hardware-widget p-4 space-y-2">
+              <div className="mb-4">
+                <p className="text-[10px] text-[var(--color-secondary-hardware)] uppercase tracking-wider mb-2">Vortex Tracker Support</p>
+                <p className="text-xs text-gray-400 leading-tight">Since VT2 .pt3 binary files rely on highly specific sample+ornament schemas, we generate a 3-Channel Multi-Track MIDI. Import directly using VT2's "File {`>`} Import MIDI..." feature.</p>
+              </div>
+
+              <button
+                onClick={downloadMidi}
+                disabled={notes.length === 0 || isProcessing}
+                className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2 transition-colors rounded-xl"
+              >
+                <Download className="w-4 h-4" />
+                <span className="text-xs uppercase font-medium">Export PT3 MIDI</span>
+              </button>
+
               <button
                 onClick={downloadJson}
                 disabled={notes.length === 0 || isProcessing}
                 className="w-full py-3 px-4 hardware-widget hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2 transition-colors border border-white/10"
               >
                 <Download className="w-4 h-4" />
-                <span className="text-xs uppercase font-medium">Export JSON</span>
+                <span className="text-xs uppercase font-medium">Export PT3 Draft (JSON)</span>
               </button>
               
               <button
@@ -336,14 +426,17 @@ export const AudioAnalyzer: React.FC = () => {
             <div className="p-4 border-bottom border-white/5 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Activity className="w-4 h-4 text-[var(--color-secondary-hardware)]" />
-                <span className="text-xs uppercase font-semibold">Note Sequence</span>
+                <span className="text-xs uppercase font-semibold">Track Sequence</span>
               </div>
               <div className="flex items-center gap-4 text-[10px] uppercase font-mono text-[var(--color-secondary-hardware)]">
                 <span className="flex items-center gap-1.5">
-                  <div className="w-2 h-2 rounded-full bg-blue-400" /> Melody
+                  <div className="w-2 h-2 rounded-full bg-blue-400" /> CH A (Melody)
                 </span>
                 <span className="flex items-center gap-1.5">
-                  <div className="w-2 h-2 rounded-full bg-amber-400" /> Bass
+                  <div className="w-2 h-2 rounded-full bg-emerald-400" /> CH B (Harmony)
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <div className="w-2 h-2 rounded-full bg-amber-400" /> CH C (Bass)
                 </span>
               </div>
             </div>
@@ -352,12 +445,17 @@ export const AudioAnalyzer: React.FC = () => {
               {isProcessing ? (
                 <div className="h-full flex flex-col items-center justify-center space-y-4 text-[var(--color-secondary-hardware)]">
                   <Loader2 className="w-10 h-10 animate-spin" />
-                  <p className="status-label">Analyzing Spectral Data...</p>
+                  <p className="status-label">Extracting 3-Channel Envelope...</p>
                 </div>
               ) : notes.length > 0 ? (
                 <div className="space-y-2">
                   <AnimatePresence mode="popLayout">
-                    {notes.map((note, idx) => (
+                    {notes.map((note, idx) => {
+                      let colorClass = 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.4)]';
+                      if (note.type === 'Channel A (Melody)') colorClass = 'bg-blue-400 shadow-[0_0_10px_rgba(96,165,250,0.4)]';
+                      if (note.type === 'Channel B (Harmony)') colorClass = 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.4)]';
+
+                      return (
                       <motion.div
                         key={`${idx}-${note.startTime}`}
                         initial={{ opacity: 0, x: -10 }}
@@ -365,29 +463,29 @@ export const AudioAnalyzer: React.FC = () => {
                         className="group flex items-center justify-between p-3 rounded-lg bg-white/5 border border-white/5 hover:border-white/10 transition-all"
                       >
                         <div className="flex items-center gap-4">
-                          <div className={`w-1 h-8 rounded-full ${note.type === 'melody' ? 'bg-blue-400 shadow-[0_0_10px_rgba(96,165,250,0.4)]' : 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.4)]'}`} />
-                          <div>
+                          <div className={`w-1 h-8 rounded-full ${colorClass}`} />
+                          <div className="w-24">
                             <p className="text-lg font-bold tracking-tight">{note.note}</p>
-                            <p className="mono-data text-xs text-[var(--color-secondary-hardware)]">{note.frequency.toFixed(1)} Hz</p>
+                            <p className="mono-data text-[9px] text-[var(--color-secondary-hardware)]">{note.type}</p>
                           </div>
                         </div>
                         
-                        <div className="flex items-center gap-8">
+                        <div className="flex items-center gap-6">
                           <div className="text-right">
-                            <p className="status-label">Timing</p>
-                            <p className="mono-data">{note.startTime.toFixed(2)}s → {note.endTime.toFixed(2)}s</p>
+                            <p className="status-label">Start</p>
+                            <p className="mono-data">{note.startTime.toFixed(2)}s</p>
                           </div>
-                          <div className="text-right w-16">
+                          <div className="text-right w-12">
                             <p className="status-label">Dur</p>
                             <p className="mono-data">{note.duration.toFixed(2)}s</p>
                           </div>
-                          <div className="text-right w-16">
+                          <div className="text-right w-12 hidden md:block">
                             <p className="status-label">Vel</p>
                             <p className="mono-data">{(note.velocity * 100).toFixed(0)}%</p>
                           </div>
                         </div>
                       </motion.div>
-                    ))}
+                    )})}
                   </AnimatePresence>
                 </div>
               ) : (
@@ -408,8 +506,8 @@ export const AudioAnalyzer: React.FC = () => {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         {[
           { label: 'Total Events', value: notes.length, icon: Layers },
-          { label: 'Melody Focus', value: notes.filter(n => n.type === 'melody').length, icon: Music },
-          { label: 'Bass Registry', value: notes.filter(n => n.type === 'bass').length, icon: Activity },
+          { label: 'CH A Events', value: notes.filter(n => n.type === 'Channel A (Melody)').length, icon: Music },
+          { label: 'CH B/C Events', value: notes.filter(n => n.type === 'Channel B (Harmony)' || n.type === 'Channel C (Bass)').length, icon: Activity },
           { label: 'Processing Latency', value: isProcessing ? 'ACTIVE' : '0.42ms', underline: true },
         ].map((stat, i) => (
           <div key={i} className="hardware-widget p-4 flex flex-col justify-between">
