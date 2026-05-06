@@ -1,0 +1,6 @@
+{
+  "name": "Audio Note Detector AI",
+  "description": "Transform audio recordings into musical notes using AI-powered pitch detection. Categorize notes into bass and melody effortlessly.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}

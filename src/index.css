@@ -1,0 +1,49 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg-hardware: #151619;
+  --color-ink-hardware: #FFFFFF;
+  --color-secondary-hardware: #8E9299;
+  --color-accent-hardware: #FF4444;
+}
+
+@layer base {
+  body {
+    @apply bg-[#E6E6E6] text-[#141414] font-sans antialiased;
+  }
+}
+
+.hardware-widget {
+  @apply bg-[var(--color-bg-hardware)] text-[var(--color-ink-hardware)] rounded-xl shadow-2xl;
+}
+
+.mono-data {
+  @apply font-mono text-[11px] tracking-wider;
+}
+
+.status-label {
+  @apply font-mono text-[10px] uppercase tracking-widest text-[var(--color-secondary-hardware)];
+}
+
+.recording-glow {
+  box-shadow: 0 0 15px rgba(255, 68, 68, 0.4);
+}
+
+/* Custom scrollbar for technical look */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-[#333] rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-[#444];
+}
